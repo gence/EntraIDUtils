@@ -11,6 +11,9 @@
 .PARAMETER OutputPath
     Path for the generated HTML file. Defaults to AppRegistrationReport.html in the current directory.
 
+.PARAMETER CsvPath
+    Optional path for a CSV export of the report data. If omitted, no CSV is generated.
+
 .PARAMETER TenantId
     Optional tenant ID. If omitted, the interactive login determines the tenant.
 
@@ -52,11 +55,16 @@
 .EXAMPLE
     .\Get-AppRegistrationReport.ps1 -AuthMethod ManagedIdentity
     System-assigned managed identity on an Azure host.
+
+.EXAMPLE
+    .\Get-AppRegistrationReport.ps1 -CsvPath .\report.csv
+    Interactive login with an additional CSV export.
 #>
 
 [CmdletBinding()]
 param(
     [string]$OutputPath = (Join-Path $PSScriptRoot "AppRegistrationReport.html"),
+    [string]$CsvPath,
     [string]$TenantId,
     [ValidateSet("Interactive", "DeviceCode", "ClientSecret", "Certificate", "ManagedIdentity")]
     [string]$AuthMethod = "Interactive",
@@ -428,8 +436,17 @@ function sortTable(col) {
 
 # ── 8. Write report ───────────────────────────────────────────────────────
 $html | Out-File -FilePath $OutputPath -Encoding utf8
-Write-Host "`nReport saved to: $OutputPath" -ForegroundColor Green
+Write-Host "`nHTML report saved to: $OutputPath" -ForegroundColor Green
 Write-Host "Open it in a browser to view." -ForegroundColor Cyan
+
+if ($CsvPath) {
+    $reportRows | Select-Object DisplayName, AppId, SignInAudience, Created,
+        HasActiveCreds, ActiveCredTypes,
+        DelegatedCount, DelegatedPerms,
+        ApplicationCount, ApplicationPerms |
+        Export-Csv -Path $CsvPath -NoTypeInformation -Encoding utf8
+    Write-Host "CSV report saved to: $CsvPath" -ForegroundColor Green
+}
 
 # ── 9. Disconnect ─────────────────────────────────────────────────────────
 Disconnect-MgGraph | Out-Null
