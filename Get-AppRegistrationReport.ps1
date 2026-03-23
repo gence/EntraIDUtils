@@ -1,10 +1,11 @@
 <#
 .SYNOPSIS
-    Generates an HTML report of Azure AD App Registrations and their Microsoft Graph permissions.
+    Generates an HTML report of Azure AD App Registrations and their API permissions.
 
 .DESCRIPTION
     Connects to Microsoft Graph, retrieves all app registrations in the tenant,
-    resolves their delegated and application (role) Microsoft Graph permissions,
+    resolves their delegated and application (role) permissions across all APIs
+    (Microsoft Graph, SharePoint, Exchange, custom APIs, etc.),
     and outputs a styled HTML report.
 
 .PARAMETER OutputPath
@@ -114,71 +115,105 @@ Write-Host "Connecting to Microsoft Graph ($AuthMethod)..." -ForegroundColor Cya
 Connect-MgGraph @connectParams -NoWelcome
 Write-Host "Connected." -ForegroundColor Green
 
-# ── 3. Build a lookup table: Graph permission ID → friendly name + type ───
-Write-Host "Loading Microsoft Graph service principal permission catalogue..." -ForegroundColor Cyan
-
-# The well-known appId for Microsoft Graph
-$graphAppId = "00000003-0000-0000-c000-000000000000"
-$graphSp = Get-MgServicePrincipal -Filter "appId eq '$graphAppId'" -Property Id, AppRoles, Oauth2PermissionScopes
-
-$permissionLookup = @{}
-
-# Application permissions (appRoles)
-foreach ($role in $graphSp.AppRoles) {
-    $permissionLookup[$role.Id] = @{
-        Name = $role.Value
-        Type = "Application"
-        Description = $role.DisplayName
-    }
-}
-
-# Delegated permissions (oauth2PermissionScopes)
-foreach ($scope in $graphSp.Oauth2PermissionScopes) {
-    $permissionLookup[$scope.Id] = @{
-        Name  = $scope.Value
-        Type  = "Delegated"
-        Description = $scope.AdminConsentDisplayName
-    }
-}
-
-Write-Host "Loaded $($permissionLookup.Count) Graph permission definitions." -ForegroundColor Green
-
-# ── 4. Retrieve all app registrations ─────────────────────────────────────
+# ── 3. Retrieve all app registrations ─────────────────────────────────────
 Write-Host "Retrieving app registrations..." -ForegroundColor Cyan
-$apps = Get-MgApplication -All -Property Id, AppId, DisplayName, RequiredResourceAccess, SignInAudience, CreatedDateTime
+$apps = Get-MgApplication -All -Property Id, AppId, DisplayName, RequiredResourceAccess, SignInAudience, CreatedDateTime, PasswordCredentials, KeyCredentials
 
 Write-Host "Found $($apps.Count) app registrations." -ForegroundColor Green
 
-# ── 5. Build report data ──────────────────────────────────────────────────
+# ── 4. Build a permission lookup for all referenced resource APIs ──────────
+Write-Host "Discovering referenced API service principals..." -ForegroundColor Cyan
+
+# Collect all unique resource app IDs referenced by any app registration
+$resourceAppIds = $apps | ForEach-Object { $_.RequiredResourceAccess } |
+    ForEach-Object { $_.ResourceAppId } | Sort-Object -Unique
+
+# permissionLookup: permission GUID → { Name, Type, Api }
+$permissionLookup = @{}
+# apiNameLookup: resourceAppId → display name
+$apiNameLookup = @{}
+
+foreach ($resAppId in $resourceAppIds) {
+    $sp = Get-MgServicePrincipal -Filter "appId eq '$resAppId'" -Property DisplayName, AppRoles, Oauth2PermissionScopes -ErrorAction SilentlyContinue
+    if (-not $sp) {
+        $apiNameLookup[$resAppId] = $resAppId  # fallback to raw ID
+        continue
+    }
+    $apiName = $sp.DisplayName
+    $apiNameLookup[$resAppId] = $apiName
+
+    foreach ($role in $sp.AppRoles) {
+        $permissionLookup[$role.Id] = @{
+            Name = $role.Value
+            Type = "Application"
+            Api  = $apiName
+        }
+    }
+    foreach ($scope in $sp.Oauth2PermissionScopes) {
+        $permissionLookup[$scope.Id] = @{
+            Name = $scope.Value
+            Type = "Delegated"
+            Api  = $apiName
+        }
+    }
+}
+
+Write-Host "Loaded permissions for $($resourceAppIds.Count) API(s): $($apiNameLookup.Values -join ', ')" -ForegroundColor Green
+
+# ── 5. Retrieve federated identity credentials for each app ──────────────
+Write-Host "Retrieving federated identity credentials..." -ForegroundColor Cyan
+$federatedCredsMap = @{}
+foreach ($app in $apps) {
+    $fedCreds = Get-MgApplicationFederatedIdentityCredential -ApplicationId $app.Id -ErrorAction SilentlyContinue
+    if ($fedCreds) {
+        $federatedCredsMap[$app.Id] = $fedCreds
+    }
+}
+Write-Host "Done." -ForegroundColor Green
+
+# ── 6. Build report data ──────────────────────────────────────────────────
 $reportRows = [System.Collections.Generic.List[PSObject]]::new()
 
 foreach ($app in $apps) {
-    # Filter to Microsoft Graph resource access entries only
-    $graphAccess = $app.RequiredResourceAccess | Where-Object { $_.ResourceAppId -eq $graphAppId }
-
     $delegated    = [System.Collections.Generic.List[string]]::new()
     $appRoles     = [System.Collections.Generic.List[string]]::new()
 
-    foreach ($resource in $graphAccess) {
+    foreach ($resource in $app.RequiredResourceAccess) {
+        $apiName = if ($apiNameLookup.ContainsKey($resource.ResourceAppId)) {
+            $apiNameLookup[$resource.ResourceAppId]
+        } else {
+            $resource.ResourceAppId
+        }
         foreach ($access in $resource.ResourceAccess) {
             $id = $access.Id
             if ($permissionLookup.ContainsKey($id)) {
                 $entry = $permissionLookup[$id]
+                $label = "$($entry.Api) / $($entry.Name)"
                 if ($entry.Type -eq "Delegated") {
-                    $delegated.Add($entry.Name)
+                    $delegated.Add($label)
                 } else {
-                    $appRoles.Add($entry.Name)
+                    $appRoles.Add($label)
                 }
             } else {
-                # Fallback: show the raw ID when the catalogue doesn't contain it
+                $label = "$apiName / Unknown ($id)"
                 if ($access.Type -eq "Scope") {
-                    $delegated.Add("Unknown ($id)")
+                    $delegated.Add($label)
                 } else {
-                    $appRoles.Add("Unknown ($id)")
+                    $appRoles.Add($label)
                 }
             }
         }
     }
+
+    $now = [datetime]::UtcNow
+    $hasActiveSecret   = [bool]($app.PasswordCredentials | Where-Object { $null -eq $_.EndDateTime -or $_.EndDateTime -gt $now })
+    $hasActiveCert     = [bool]($app.KeyCredentials      | Where-Object { $null -eq $_.EndDateTime -or $_.EndDateTime -gt $now })
+    $hasActiveFederated = $federatedCredsMap.ContainsKey($app.Id)
+
+    $activeCredTypes = [System.Collections.Generic.List[string]]::new()
+    if ($hasActiveSecret)    { $activeCredTypes.Add("Secret") }
+    if ($hasActiveCert)      { $activeCredTypes.Add("Certificate") }
+    if ($hasActiveFederated) { $activeCredTypes.Add("Federated") }
 
     $reportRows.Add([PSCustomObject]@{
         DisplayName        = $app.DisplayName
@@ -189,12 +224,14 @@ foreach ($app in $apps) {
         ApplicationPerms   = ($appRoles  | Sort-Object) -join ", "
         DelegatedCount     = $delegated.Count
         ApplicationCount   = $appRoles.Count
+        HasActiveCreds     = $activeCredTypes.Count -gt 0
+        ActiveCredTypes    = $activeCredTypes -join ", "
     })
 }
 
 $reportRows = $reportRows | Sort-Object DisplayName
 
-# ── 6. Generate HTML ──────────────────────────────────────────────────────
+# ── 7. Generate HTML ──────────────────────────────────────────────────────
 $totalApps       = $reportRows.Count
 $appsWithAppPerms = ($reportRows | Where-Object { $_.ApplicationCount -gt 0 }).Count
 $timestamp        = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
@@ -205,7 +242,7 @@ $html = @"
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>App Registration &ndash; Graph Permissions Report</title>
+<title>App Registration &ndash; API Permissions Report</title>
 <style>
     :root {
         --bg: #f4f6f9;
@@ -265,6 +302,9 @@ $html = @"
     .perm-delegated { background: #e6f7ee; color: #1a7f37; }
     .perm-application { background: var(--danger-light); color: var(--danger); }
     .perm-none { color: #999; font-style: italic; }
+    .cred-true  { color: #1a7f37; font-weight: 600; }
+    .cred-false { color: #999; font-style: italic; }
+    .cred-types { font-size: 0.78rem; color: var(--text-light); }
     .badge {
         display: inline-block; padding: 1px 7px; border-radius: 10px;
         font-size: 0.75rem; font-weight: 600; margin-left: 6px;
@@ -276,7 +316,7 @@ $html = @"
 </head>
 <body>
 
-<h1>&#x1F4CB; App Registration &ndash; Graph Permissions Report</h1>
+<h1>&#x1F4CB; App Registration &ndash; API Permissions Report</h1>
 <p class="subtitle">Generated $timestamp</p>
 
 <div class="summary">
@@ -295,8 +335,9 @@ $html = @"
     <th onclick="sortTable(1)">App (Client) ID <span class="sort-arrow">&#x25B2;&#x25BC;</span></th>
     <th onclick="sortTable(2)">Audience <span class="sort-arrow">&#x25B2;&#x25BC;</span></th>
     <th onclick="sortTable(3)">Created <span class="sort-arrow">&#x25B2;&#x25BC;</span></th>
-    <th onclick="sortTable(4)">Delegated Permissions <span class="sort-arrow">&#x25B2;&#x25BC;</span></th>
-    <th onclick="sortTable(5)">Application Permissions <span class="sort-arrow">&#x25B2;&#x25BC;</span></th>
+    <th onclick="sortTable(4)">Active Credentials <span class="sort-arrow">&#x25B2;&#x25BC;</span></th>
+    <th onclick="sortTable(5)">Delegated Permissions <span class="sort-arrow">&#x25B2;&#x25BC;</span></th>
+    <th onclick="sortTable(6)">Application Permissions <span class="sort-arrow">&#x25B2;&#x25BC;</span></th>
 </tr>
 </thead>
 <tbody>
@@ -329,6 +370,13 @@ foreach ($row in $reportRows) {
     if ($row.DelegatedCount -gt 0)   { $badges += "<span class='badge badge-del'>$($row.DelegatedCount) delegated</span>" }
     if ($row.ApplicationCount -gt 0) { $badges += "<span class='badge badge-app'>$($row.ApplicationCount) application</span>" }
 
+    if ($row.HasActiveCreds) {
+        $typesHtml = [System.Net.WebUtility]::HtmlEncode($row.ActiveCredTypes)
+        $credHtml = "<span class='cred-true'>True</span><br/><span class='cred-types'>($typesHtml)</span>"
+    } else {
+        $credHtml = "<span class='cred-false'>False</span>"
+    }
+
     $html += @"
 
 <tr>
@@ -336,6 +384,7 @@ foreach ($row in $reportRows) {
     <td style="font-family:monospace;font-size:0.8rem;">$appIdHtml</td>
     <td>$audienceHtml</td>
     <td>$($row.Created)</td>
+    <td>$credHtml</td>
     <td>$delHtml</td>
     <td>$appHtml</td>
 </tr>
@@ -377,11 +426,11 @@ function sortTable(col) {
 </html>
 "@
 
-# ── 7. Write report ───────────────────────────────────────────────────────
+# ── 8. Write report ───────────────────────────────────────────────────────
 $html | Out-File -FilePath $OutputPath -Encoding utf8
 Write-Host "`nReport saved to: $OutputPath" -ForegroundColor Green
 Write-Host "Open it in a browser to view." -ForegroundColor Cyan
 
-# ── 8. Disconnect ─────────────────────────────────────────────────────────
+# ── 9. Disconnect ─────────────────────────────────────────────────────────
 Disconnect-MgGraph | Out-Null
 Write-Host "Disconnected from Microsoft Graph." -ForegroundColor Gray
